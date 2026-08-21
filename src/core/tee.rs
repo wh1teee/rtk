@@ -51,7 +51,9 @@ fn get_tee_dir(config: &Config) -> Option<PathBuf> {
 }
 
 /// Rotate old tee files: keep only the last `max_files`, delete oldest.
-fn cleanup_old_files(dir: &std::path::Path, max_files: usize) {
+/// `preserve` is the file being returned to the current caller and must still
+/// exist when this write transaction completes.
+fn cleanup_old_files(dir: &std::path::Path, max_files: usize, preserve: Option<&std::path::Path>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .ok()
         .into_iter()
@@ -60,17 +62,88 @@ fn cleanup_old_files(dir: &std::path::Path, max_files: usize) {
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
         .collect();
 
-    if entries.len() <= max_files {
+    let retained = max_files.max(usize::from(preserve.is_some()));
+    if entries.len() <= retained {
         return;
     }
 
-    // Sort by filename (which starts with epoch timestamp = chronological)
-    entries.sort_by_key(|e| e.file_name());
+    // Filenames contain random uniqueness suffixes. Rotation ordering comes
+    // from the completed file write time, with the filename only as a stable
+    // tie-breaker for filesystems whose timestamp resolution is coarse.
+    entries.sort_by(|left, right| {
+        let left_modified = left
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let right_modified = right
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        left_modified
+            .cmp(&right_modified)
+            .then_with(|| {
+                tee_order_from_name(&left.file_name()).cmp(&tee_order_from_name(&right.file_name()))
+            })
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
 
-    let to_remove = entries.len() - max_files;
-    for entry in entries.iter().take(to_remove) {
-        let _ = std::fs::remove_file(entry.path());
+    let mut to_remove = entries.len() - retained;
+    for entry in entries {
+        if to_remove == 0 {
+            break;
+        }
+        let path = entry.path();
+        if preserve.is_some_and(|current| current == path) {
+            continue;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            to_remove -= 1;
+        }
     }
+}
+
+fn tee_order_from_name(name: &std::ffi::OsStr) -> Option<u64> {
+    let name = name.to_str()?;
+    let mut parts = name.splitn(3, '_');
+    parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+fn next_tee_order(tee_dir: &std::path::Path) -> Option<u64> {
+    let current = std::fs::read_dir(tee_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
+        .filter_map(|entry| tee_order_from_name(&entry.file_name()))
+        .max()
+        .unwrap_or(0);
+    current.checked_add(1)
+}
+
+fn random_tee_suffix() -> Option<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    let mut suffix = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        suffix.push(HEX[(byte >> 4) as usize] as char);
+        suffix.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(suffix)
+}
+
+fn lock_tee_dir(tee_dir: &std::path::Path) -> Option<std::fs::File> {
+    let lock_path = tee_dir.join(".rotation.lock");
+    let lock = crate::core::utils::open_private(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true),
+        &lock_path,
+    )
+    .ok()?;
+    lock.lock().ok()?;
+    Some(lock)
 }
 
 /// Check if tee should be skipped based on config, mode, exit code, and size.
@@ -123,12 +196,6 @@ fn write_tee_file(
     create_tee_dir(tee_dir)?;
 
     let slug = sanitize_slug(command_slug);
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let filename = format!("{}_{}.log", epoch, slug);
-    let filepath = tee_dir.join(filename);
 
     // Truncate at max_file_size (find a safe UTF-8 char boundary)
     let content = if raw.len() > max_file_size {
@@ -147,19 +214,34 @@ fn write_tee_file(
         raw.to_string()
     };
 
-    let mut file = crate::core::utils::open_private(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true),
-        &filepath,
-    )
-    .ok()?;
+    // Tee writes are rare (failure/truncation recovery), so serialize the tiny
+    // create/write/rotate transaction across RTK processes. This prevents one
+    // caller's rotation from unlinking another caller's still-active path.
+    let _rotation_lock = lock_tee_dir(tee_dir)?;
+    let order = next_tee_order(tee_dir)?;
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let (filepath, mut file) = loop {
+        let suffix = random_tee_suffix()?;
+        let filename = format!("{}_{:020}_{}_{}.log", epoch, order, slug, suffix);
+        let filepath = tee_dir.join(filename);
+        let opened = crate::core::utils::open_private(
+            std::fs::OpenOptions::new().write(true).create_new(true),
+            &filepath,
+        );
+        match opened {
+            Ok(file) => break (filepath, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    };
     use std::io::Write;
     file.write_all(content.as_bytes()).ok()?;
 
     // Rotate old files
-    cleanup_old_files(tee_dir, max_files);
+    cleanup_old_files(tee_dir, max_files, Some(&filepath));
 
     Some(filepath)
 }
@@ -427,6 +509,136 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_tee_writes_use_distinct_files() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const WRITERS: usize = 32;
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = Arc::new(tmpdir.path().join("tee"));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+
+        for writer in 0..WRITERS {
+            let tee_dir = Arc::clone(&tee_dir);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let content = format!("CALLER_{writer}_UNIQUE\n").repeat(100);
+                barrier.wait();
+                let path = write_tee_file(
+                    &content,
+                    "test",
+                    &tee_dir,
+                    DEFAULT_MAX_FILE_SIZE,
+                    WRITERS * 2,
+                )
+                .expect("tee file written");
+                (content, path)
+            }));
+        }
+
+        let mut paths = HashSet::new();
+        for handle in handles {
+            let (expected, path) = handle.join().expect("tee writer thread");
+            assert!(paths.insert(path.clone()), "tee path was reused: {path:?}");
+            assert_eq!(fs::read_to_string(path).unwrap(), expected);
+        }
+        assert_eq!(paths.len(), WRITERS);
+    }
+
+    #[test]
+    fn test_rotation_keeps_newest_paths_unique_and_available() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        const WRITERS: usize = 8;
+        const MAX_FILES: usize = 2;
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let mut paths = HashSet::new();
+        let mut writes = Vec::new();
+
+        for writer in 0..WRITERS {
+            let content = format!("ROTATION_CALLER_{writer}_UNIQUE\n").repeat(100);
+            let path = write_tee_file(&content, "test", &tee_dir, DEFAULT_MAX_FILE_SIZE, MAX_FILES)
+                .expect("tee file written");
+            assert!(
+                path.exists(),
+                "write returned a path already removed by rotation"
+            );
+            assert!(paths.insert(path.clone()), "tee path was reused: {path:?}");
+            writes.push((path, content));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let remaining: HashSet<_> = fs::read_dir(&tee_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        assert_eq!(remaining.len(), MAX_FILES);
+        for (path, expected) in writes.iter().rev().take(MAX_FILES) {
+            assert!(remaining.contains(path), "newest tee log was rotated out");
+            assert_eq!(fs::read_to_string(path).unwrap(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_rotation_uses_write_order_when_modification_times_tie() {
+        use std::collections::HashSet;
+        use std::fs::{File, FileTimes};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        const WRITERS: usize = 6;
+        const MAX_FILES: usize = 2;
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let mut writes = Vec::new();
+
+        for writer in 0..WRITERS {
+            let content = format!("TIED_MTIME_CALLER_{writer}\n").repeat(100);
+            let path = write_tee_file(
+                &content,
+                "test",
+                &tee_dir,
+                DEFAULT_MAX_FILE_SIZE,
+                WRITERS * 2,
+            )
+            .expect("tee file written");
+            writes.push((path, content));
+        }
+
+        let tied_time = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for (path, _) in &writes {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(tied_time))
+                .unwrap();
+        }
+
+        cleanup_old_files(&tee_dir, MAX_FILES, None);
+
+        let remaining: HashSet<_> = fs::read_dir(&tee_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        assert_eq!(remaining.len(), MAX_FILES);
+        for (path, expected) in writes.iter().rev().take(MAX_FILES) {
+            assert!(
+                remaining.contains(path),
+                "newest ordered tee log was rotated out"
+            );
+            assert_eq!(fs::read_to_string(path).unwrap(), *expected);
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_write_tee_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -534,7 +746,7 @@ mod tests {
             fs::write(dir.join(&filename), "content").unwrap();
         }
 
-        cleanup_old_files(dir, 20);
+        cleanup_old_files(dir, 20, None);
 
         let remaining: Vec<_> = fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(remaining.len(), 20);
